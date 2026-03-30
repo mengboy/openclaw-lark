@@ -4,6 +4,12 @@
  *
  * Reply dispatcher factory for the Lark/Feishu channel plugin.
  *
+ * OpenClaw event contract note:
+ * The streaming-card path depends on a small subset of OpenClaw reply/runtime
+ * callbacks and on `deliver(payload, info)` exposing `info.kind`.
+ * When upgrading the main OpenClaw repo, verify the contract documented in
+ * `src/card/OPENCLAW_EVENT_CONTRACT.md` before changing this file.
+ *
  * Thin factory function that:
  * 1. Resolves account, reply mode, and typing indicator config
  * 2. In streaming mode, delegates to StreamingCardController
@@ -90,6 +96,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const controller = useStreamingCards
     ? new StreamingCardController({
         cfg,
+        agentId,
         sessionKey,
         accountId,
         chatId,
@@ -185,11 +192,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
     onReplyStart: async () => {
       if (shouldSkip('onReplyStart')) return;
+      if (controller) {
+        await controller.ensureCardCreated();
+        if (controller.isTerminated) return;
+      }
       await typingCallbacks.onReplyStart?.();
     },
 
-    deliver: async (payload: ReplyPayload) => {
+    deliver: async (payload: ReplyPayload, info?: { kind?: string }) => {
+      const kind = info?.kind ?? 'message';
       log.debug('deliver called', {
+        kind,
         textPreview: payload.text?.slice(0, 100),
       });
 
@@ -227,6 +240,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         if (controller.isTerminated) return;
 
         if (controller.cardMessageId) {
+          if (kind === 'tool') {
+            await controller.onToolPayload(payload);
+            return;
+          }
           await controller.onDeliver(payload);
           return;
         }
@@ -394,12 +411,20 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     dispatcher,
     replyOptions: {
       ...replyOptions,
-      onModelSelected: prefixContext.onModelSelected,
+      onModelSelected: (ctx: { provider: string; model: string; thinkLevel: string | undefined }) => {
+        prefixContext.onModelSelected?.(ctx);
+        controller?.onModelSelected(ctx);
+      },
       disableBlockStreaming: !enableBlockStreaming,
       ...(controller
         ? {
             onReasoningStream: (payload: ReplyPayload) => controller.onReasoningStream(payload),
             onPartialReply: (payload: ReplyPayload) => controller.onPartialReply(payload),
+            onToolStart: (payload: { name?: string; phase?: string }) => controller.onToolStart(payload),
+            onCompactionStart: () => controller.onCompactionStart(),
+            onCompactionEnd: () => controller.onCompactionEnd(),
+            onAssistantMessageStart: () => controller.onAssistantMessageStart(),
+            onReasoningEnd: () => controller.onReasoningEnd(),
           }
         : {}),
     },

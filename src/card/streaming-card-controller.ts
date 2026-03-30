@@ -20,7 +20,15 @@ import { larkLogger } from '../core/lark-logger';
 import { LarkClient } from '../core/lark-client';
 import { registerShutdownHook } from '../core/shutdown-hooks';
 import { sendCardFeishu, updateCardFeishu } from '../messaging/outbound/send';
-import { STREAMING_ELEMENT_ID, buildCardContent, splitReasoningText, stripReasoningTags, toCardKit2 } from './builder';
+import {
+  STREAMING_ELEMENT_ID,
+  STREAMING_STATUS_ELEMENT_ID,
+  buildCardContent,
+  buildStatusText,
+  splitReasoningText,
+  stripReasoningTags,
+  toCardKit2,
+} from './builder';
 import {
   FEISHU_CARD_TABLE_LIMIT,
   isCardRateLimitError,
@@ -65,44 +73,70 @@ interface TerminalCardContentInput {
   reasoningText?: string;
 }
 
-// ---------------------------------------------------------------------------
-// CardKit 2.0 initial streaming payload
-// ---------------------------------------------------------------------------
+interface ModelSelectedPayload {
+  provider: string;
+  model: string;
+  thinkLevel?: string;
+}
 
-const STREAMING_THINKING_CARD = {
-  schema: '2.0',
-  config: {
-    streaming_mode: true,
-    // locales 用于支持多语言摘要展示
-    locales: ['zh_cn', 'en_us'],
-    summary: {
-      content: 'Thinking...',
-      i18n_content: { zh_cn: '思考中...', en_us: 'Thinking...' },
+function buildStreamingThinkingCard(agentLabel?: string) {
+  const label = agentLabel?.trim() || 'main';
+  return {
+    schema: '2.0',
+    config: {
+      streaming_mode: true,
+      locales: ['zh_cn', 'en_us'],
+      summary: {
+        content: `${label} · Working`,
+        i18n_content: { zh_cn: `${label} · 处理中`, en_us: `${label} · Working` },
+      },
     },
-  },
-  body: {
-    elements: [
-      {
-        tag: 'markdown',
-        content: '',
-        text_align: 'left',
-        text_size: 'normal_v2',
-        margin: '0px 0px 0px 0px',
-        element_id: STREAMING_ELEMENT_ID,
-      },
-      {
-        tag: 'markdown',
-        content: ' ',
-        icon: {
-          tag: 'custom_icon',
-          img_key: 'img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg',
-          size: '16px 16px',
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: `${label} · Working`,
+        i18n_content: {
+          zh_cn: `${label} · 处理中`,
+          en_us: `${label} · Working`,
         },
-        element_id: 'loading_icon',
       },
-    ],
-  },
-} as const;
+      template: 'orange',
+    },
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          content: 'Working · Thinking...',
+          i18n_content: {
+            zh_cn: '处理中 · 思考中...',
+            en_us: 'Working · Thinking...',
+          },
+          text_size: 'notation',
+          margin: '0px 0px 8px 0px',
+          element_id: STREAMING_STATUS_ELEMENT_ID,
+        },
+        {
+          tag: 'markdown',
+          content: '',
+          text_align: 'left',
+          text_size: 'normal_v2',
+          margin: '0px 0px 0px 0px',
+          element_id: STREAMING_ELEMENT_ID,
+        },
+        {
+          tag: 'markdown',
+          content: ' ',
+          icon: {
+            tag: 'custom_icon',
+            img_key: 'img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg',
+            size: '16px 16px',
+          },
+          element_id: 'loading_icon',
+        },
+      ],
+    },
+  } as const;
+}
 
 // ---------------------------------------------------------------------------
 // StreamingCardController
@@ -131,6 +165,20 @@ export class StreamingCardController {
     reasoningElapsedMs: 0,
     isReasoningPhase: false,
   };
+  private toolCalls: Array<{
+    name: string;
+    status: 'running' | 'complete' | 'error';
+    result?: string;
+  }> = [];
+  private runtimeMeta: {
+    provider?: string;
+    model?: string;
+    thinkLevel?: string;
+    activityText?: string;
+    isCompacting: boolean;
+  } = {
+    isCompacting: false,
+  };
 
   // ---- Sub-controllers ----
   private readonly flush: FlushController;
@@ -144,6 +192,7 @@ export class StreamingCardController {
   private cardCreationPromise: Promise<void> | null = null;
   private disposeShutdownHook: (() => void) | null = null;
   private readonly dispatchStartTime = Date.now();
+  private elapsedRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ---- Injected dependencies ----
   private readonly deps: StreamingCardDeps;
@@ -227,6 +276,7 @@ export class StreamingCardController {
           totalTokensFresh: typeof entry.totalTokensFresh === 'boolean' ? entry.totalTokensFresh : undefined,
           contextTokens: typeof entry.contextTokens === 'number' ? entry.contextTokens : undefined,
           model: typeof entry.model === 'string' ? entry.model : undefined,
+          provider: typeof entry.provider === 'string' ? entry.provider : undefined,
         };
         log.debug('footer metrics lookup: session entry found', {
           sessionKey: this.deps.sessionKey,
@@ -280,6 +330,7 @@ export class StreamingCardController {
         totalTokensFresh: typeof entry.totalTokensFresh === 'boolean' ? entry.totalTokensFresh : undefined,
         contextTokens: typeof entry.contextTokens === 'number' ? entry.contextTokens : undefined,
         model: typeof entry.model === 'string' ? entry.model : undefined,
+        provider: typeof entry.provider === 'string' ? entry.provider : undefined,
       };
       log.debug('footer metrics lookup: session entry found', {
         sessionKey: this.deps.sessionKey,
@@ -316,6 +367,21 @@ export class StreamingCardController {
         }
       },
     });
+  }
+
+  private getRuntimeMeta(elapsedMs: number = this.elapsed()) {
+    return {
+      agentLabel: this.deps.agentId,
+      provider: this.runtimeMeta.provider,
+      model: this.runtimeMeta.model,
+      activityText: this.runtimeMeta.activityText,
+      elapsedMs,
+    };
+  }
+
+  private async refreshCardForProcessState(): Promise<void> {
+    if (!this.cardKit.cardMessageId || this.isTerminalPhase) return;
+    await this.throttledCardUpdate();
   }
 
   // ------------------------------------------------------------------
@@ -400,6 +466,9 @@ export class StreamingCardController {
     }
     this.phase = to;
     log.info('phase transition', { from, to, source, reason });
+    if (to === 'streaming') {
+      this.startElapsedRefresh();
+    }
     if (TERMINAL_PHASES.has(to)) {
       this._terminalReason = reason ?? null;
       this.onEnterTerminalPhase();
@@ -411,8 +480,39 @@ export class StreamingCardController {
     this.createEpoch += 1;
     this.flush.cancelPendingFlush();
     this.flush.complete();
+    this.stopElapsedRefresh();
     this.disposeShutdownHook?.();
     this.disposeShutdownHook = null;
+  }
+
+  private startElapsedRefresh(): void {
+    if (this.elapsedRefreshTimer || this.isTerminalPhase) return;
+    const tick = async () => {
+      if (this.isTerminalPhase || !this.cardKit.cardMessageId) {
+        this.stopElapsedRefresh();
+        return;
+      }
+      try {
+        await this.flush.flush();
+      } finally {
+        if (!this.isTerminalPhase && this.cardKit.cardMessageId) {
+          this.elapsedRefreshTimer = setTimeout(() => {
+            void tick();
+          }, 1000);
+        } else {
+          this.elapsedRefreshTimer = null;
+        }
+      }
+    };
+    this.elapsedRefreshTimer = setTimeout(() => {
+      void tick();
+    }, 1000);
+  }
+
+  private stopElapsedRefresh(): void {
+    if (!this.elapsedRefreshTimer) return;
+    clearTimeout(this.elapsedRefreshTimer);
+    this.elapsedRefreshTimer = null;
   }
 
   // ------------------------------------------------------------------
@@ -427,6 +527,9 @@ export class StreamingCardController {
    */
   async onDeliver(payload: ReplyPayload): Promise<void> {
     if (!this.shouldProceed('onDeliver')) return;
+    if (!this.runtimeMeta.isCompacting) {
+      this.runtimeMeta.activityText = 'drafting response';
+    }
 
     const text = payload.text ?? '';
     if (!text.trim()) return;
@@ -467,8 +570,82 @@ export class StreamingCardController {
     }
   }
 
+  async onToolPayload(payload: ReplyPayload): Promise<void> {
+    if (!this.shouldProceed('onToolPayload')) return;
+    const text = payload.text?.trim();
+    const runningIndex = this.toolCalls.findIndex((tool) => tool.status === 'running');
+    if (runningIndex >= 0) {
+      this.toolCalls[runningIndex] = {
+        ...this.toolCalls[runningIndex],
+        status: payload.isError ? 'error' : 'complete',
+        result: text,
+      };
+    } else if (text) {
+      this.toolCalls.unshift({
+        name: 'tool',
+        status: payload.isError ? 'error' : 'complete',
+        result: text,
+      });
+      this.toolCalls = this.toolCalls.slice(0, 6);
+    }
+    this.runtimeMeta.activityText = text || 'tool completed';
+    await this.refreshCardForProcessState();
+  }
+
+  async onToolStart(payload: { name?: string; phase?: string }): Promise<void> {
+    if (!this.shouldProceed('onToolStart')) return;
+    const name = payload.name?.trim() || 'tool';
+    const existing = this.toolCalls.find((tool) => tool.name === name && tool.status === 'running');
+    if (!existing) {
+      this.toolCalls.unshift({ name, status: 'running' });
+      this.toolCalls = this.toolCalls.slice(0, 6);
+    }
+    this.runtimeMeta.activityText = `running ${name}`;
+    await this.refreshCardForProcessState();
+  }
+
+  async onCompactionStart(): Promise<void> {
+    if (!this.shouldProceed('onCompactionStart')) return;
+    this.runtimeMeta.isCompacting = true;
+    this.runtimeMeta.activityText = 'compacting context';
+    await this.refreshCardForProcessState();
+  }
+
+  async onCompactionEnd(): Promise<void> {
+    if (!this.shouldProceed('onCompactionEnd')) return;
+    this.runtimeMeta.isCompacting = false;
+    this.runtimeMeta.activityText = 'resuming response';
+    await this.refreshCardForProcessState();
+  }
+
+  async onAssistantMessageStart(): Promise<void> {
+    if (!this.shouldProceed('onAssistantMessageStart')) return;
+    if (!this.runtimeMeta.isCompacting) {
+      this.runtimeMeta.activityText = 'drafting response';
+      await this.refreshCardForProcessState();
+    }
+  }
+
+  async onReasoningEnd(): Promise<void> {
+    if (!this.shouldProceed('onReasoningEnd')) return;
+    if (!this.runtimeMeta.isCompacting) {
+      this.runtimeMeta.activityText = 'reasoning complete';
+      await this.refreshCardForProcessState();
+    }
+  }
+
+  onModelSelected(payload: ModelSelectedPayload): void {
+    this.runtimeMeta.provider = payload.provider?.trim() || this.runtimeMeta.provider;
+    this.runtimeMeta.model = payload.model?.trim() || this.runtimeMeta.model;
+    this.runtimeMeta.thinkLevel = payload.thinkLevel;
+    if (this.cardKit.cardMessageId && !this.isTerminalPhase) {
+      void this.throttledCardUpdate();
+    }
+  }
+
   async onReasoningStream(payload: ReplyPayload): Promise<void> {
     if (!this.shouldProceed('onReasoningStream')) return;
+    this.runtimeMeta.activityText = 'thinking';
 
     await this.ensureCardCreated();
     if (!this.shouldProceed('onReasoningStream.postCreate')) return;
@@ -488,6 +665,9 @@ export class StreamingCardController {
 
   async onPartialReply(payload: ReplyPayload): Promise<void> {
     if (!this.shouldProceed('onPartialReply')) return;
+    if (!this.runtimeMeta.isCompacting) {
+      this.runtimeMeta.activityText = 'streaming reply';
+    }
 
     // Use splitReasoningText (consistent with onDeliver/onReasoningStream)
     // to extract <think> tag content before stripping it from the answer.
@@ -566,8 +746,10 @@ export class StreamingCardController {
           reasoningElapsedMs: this.reasoning.reasoningElapsedMs || undefined,
           elapsedMs: this.elapsed(),
           isError: true,
+          toolCalls: this.toolCalls,
           footer: this.deps.resolvedFooter,
           footerMetrics,
+          runtimeMeta: this.getRuntimeMeta(),
         });
         if (errorEffectiveCardId) {
           await this.closeStreamingAndUpdate(errorEffectiveCardId, errorCard, 'onError');
@@ -645,8 +827,10 @@ export class StreamingCardController {
           reasoningText: terminalContent.reasoningText,
           reasoningElapsedMs: this.reasoning.reasoningElapsedMs || undefined,
           elapsedMs: this.elapsed(),
+          toolCalls: this.toolCalls,
           footer: this.deps.resolvedFooter,
           footerMetrics,
+          runtimeMeta: this.getRuntimeMeta(),
         });
 
         if (idleEffectiveCardId) {
@@ -720,8 +904,10 @@ export class StreamingCardController {
           reasoningElapsedMs: this.reasoning.reasoningElapsedMs || undefined,
           elapsedMs,
           isAborted: true,
+          toolCalls: this.toolCalls,
           footer: this.deps.resolvedFooter,
           footerMetrics,
+          runtimeMeta: this.getRuntimeMeta(elapsedMs),
         });
         await this.closeStreamingAndUpdate(effectiveCardId, abortCardContent, 'abortCard');
         log.info('abortCard completed', { effectiveCardId });
@@ -733,8 +919,10 @@ export class StreamingCardController {
           reasoningElapsedMs: this.reasoning.reasoningElapsedMs || undefined,
           elapsedMs,
           isAborted: true,
+          toolCalls: this.toolCalls,
           footer: this.deps.resolvedFooter,
           footerMetrics,
+          runtimeMeta: this.getRuntimeMeta(elapsedMs),
         });
         await updateCardFeishu({
           cfg: this.deps.cfg,
@@ -773,7 +961,7 @@ export class StreamingCardController {
           // Step 1: Create card entity
           const cId = await createCardEntity({
             cfg: this.deps.cfg,
-            card: STREAMING_THINKING_CARD,
+            card: buildStreamingThinkingCard(this.deps.agentId),
             accountId: this.deps.accountId,
           });
 
@@ -822,6 +1010,7 @@ export class StreamingCardController {
               this.disposeShutdownHook = null;
               return;
             }
+            await this.flushBufferedStateAfterCreate();
             log.info('sent CardKit card', { messageId: result.messageId });
           } else {
             throw new Error('card.create returned empty card_id');
@@ -837,7 +1026,9 @@ export class StreamingCardController {
           this.cardKit.cardKitCardId = null;
           this.cardKit.originalCardKitCardId = null;
 
-          const fallbackCard = buildCardContent('thinking');
+          const fallbackCard = buildCardContent('thinking', {
+            runtimeMeta: this.getRuntimeMeta(),
+          });
           const result = await sendCardFeishu({
             cfg: this.deps.cfg,
             to: this.deps.chatId,
@@ -860,6 +1051,7 @@ export class StreamingCardController {
           if (!this.transition('streaming', 'ensureCardCreated.imFallback')) {
             return;
           }
+          await this.flushBufferedStateAfterCreate();
           log.info('sent fallback IM card', { messageId: result.messageId });
         }
       } catch (err) {
@@ -879,6 +1071,24 @@ export class StreamingCardController {
   // ------------------------------------------------------------------
   // Internal: flush
   // ------------------------------------------------------------------
+
+  private hasBufferedStreamingState(): boolean {
+    return !!(this.text.accumulatedText || this.reasoning.accumulatedReasoningText || this.runtimeMeta.activityText);
+  }
+
+  private buildStreamingStatusText(): string {
+    const statusText = buildStatusText({
+      status: this.phase === 'completed' ? 'Completed' : 'Working',
+      statusZh: this.phase === 'completed' ? '已完成' : '处理中',
+      runtimeMeta: this.getRuntimeMeta(),
+    });
+    return statusText?.en || 'Working';
+  }
+
+  private async flushBufferedStateAfterCreate(): Promise<void> {
+    if (!this.cardKit.cardMessageId || this.isTerminalPhase || !this.hasBufferedStreamingState()) return;
+    await this.flush.flush();
+  }
 
   private async performFlush(): Promise<void> {
     if (!this.cardKit.cardMessageId || this.isTerminalPhase) return;
@@ -902,9 +1112,25 @@ export class StreamingCardController {
 
       if (this.cardKit.cardKitCardId) {
         // CardKit streaming — typewriter effect
+        const statusText = this.buildStreamingStatusText();
+        const statusSeqBefore = this.cardKit.cardKitSequence;
+        this.cardKit.cardKitSequence += 1;
+        log.debug('flushCardUpdate: status seq bump', {
+          seqBefore: statusSeqBefore,
+          seqAfter: this.cardKit.cardKitSequence,
+        });
+        await streamCardContent({
+          cfg: this.deps.cfg,
+          cardId: this.cardKit.cardKitCardId,
+          elementId: STREAMING_STATUS_ELEMENT_ID,
+          content: statusText,
+          sequence: this.cardKit.cardKitSequence,
+          accountId: this.deps.accountId,
+        });
+
         const prevSeq = this.cardKit.cardKitSequence;
         this.cardKit.cardKitSequence += 1;
-        log.debug('flushCardUpdate: seq bump', {
+        log.debug('flushCardUpdate: content seq bump', {
           seqBefore: prevSeq,
           seqAfter: this.cardKit.cardKitSequence,
         });
@@ -921,6 +1147,8 @@ export class StreamingCardController {
         const card = buildCardContent('streaming', {
           text: this.reasoning.isReasoningPhase ? '' : resolvedText,
           reasoningText: this.reasoning.isReasoningPhase ? this.reasoning.accumulatedReasoningText : undefined,
+          toolCalls: this.toolCalls,
+          runtimeMeta: this.getRuntimeMeta(),
         });
         await updateCardFeishu({
           cfg: this.deps.cfg,

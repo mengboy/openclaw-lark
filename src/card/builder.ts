@@ -22,6 +22,7 @@ import type { FooterSessionMetrics } from './reply-dispatcher-types';
  */
 export const STREAMING_ELEMENT_ID = 'streaming_content';
 export const REASONING_ELEMENT_ID = 'reasoning_content';
+export const STREAMING_STATUS_ELEMENT_ID = 'streaming_status';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -59,6 +60,14 @@ export interface ConfirmData {
   operationDescription: string;
   pendingOperationId: string;
   preview?: string;
+}
+
+export interface RuntimeCardMeta {
+  agentLabel?: string;
+  provider?: string;
+  model?: string;
+  activityText?: string;
+  elapsedMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -330,13 +339,14 @@ export function buildCardContent(
       model?: boolean;
     };
     footerMetrics?: FooterSessionMetrics;
+    runtimeMeta?: RuntimeCardMeta;
   } = {},
 ): FeishuCard {
   switch (state) {
     case 'thinking':
-      return buildThinkingCard();
+      return buildThinkingCard(data.runtimeMeta);
     case 'streaming':
-      return buildStreamingCard(data.text ?? '', data.toolCalls ?? [], data.reasoningText);
+      return buildStreamingCard(data.text ?? '', data.toolCalls ?? [], data.reasoningText, data.runtimeMeta);
     case 'complete':
       return buildCompleteCard({
         text: data.text ?? '',
@@ -348,6 +358,7 @@ export function buildCardContent(
         isAborted: data.isAborted,
         footer: data.footer,
         footerMetrics: data.footerMetrics,
+        runtimeMeta: data.runtimeMeta,
       });
     case 'confirm':
       return buildConfirmCard(data.confirmData!);
@@ -360,10 +371,93 @@ export function buildCardContent(
 // Private card builders
 // ---------------------------------------------------------------------------
 
-function buildThinkingCard(): FeishuCard {
+function buildStatusLine(params: {
+  status: 'Thinking' | 'Working' | 'Completed' | 'Error' | 'Stopped';
+  statusZh: string;
+  runtimeMeta?: RuntimeCardMeta;
+}): CardElement | null {
+  const statusText = buildStatusText(params);
+  if (!statusText) return null;
+  return {
+    tag: 'markdown',
+    content: statusText.en,
+    i18n_content: { zh_cn: statusText.zh, en_us: statusText.en },
+    text_size: 'notation',
+  };
+}
+
+export function buildStatusText(params: {
+  status: 'Thinking' | 'Working' | 'Completed' | 'Error' | 'Stopped';
+  statusZh: string;
+  runtimeMeta?: RuntimeCardMeta;
+}): { zh: string; en: string } | null {
+  const { status, statusZh, runtimeMeta } = params;
+  const elapsed =
+    typeof runtimeMeta?.elapsedMs === 'number' && runtimeMeta.elapsedMs >= 0
+      ? formatElapsed(runtimeMeta.elapsedMs)
+      : undefined;
+  const activity = runtimeMeta?.activityText?.trim();
+  const detailEn = [status, elapsed, activity].filter(Boolean).join(' · ');
+  const detailZh = [statusZh, elapsed, activity].filter(Boolean).join(' · ');
+  if (!detailEn && !detailZh) return null;
+  return { zh: detailZh || detailEn, en: detailEn };
+}
+
+function buildHeader(params: {
+  status: 'Thinking' | 'Working' | 'Completed' | 'Error' | 'Stopped';
+  statusZh: string;
+  runtimeMeta?: RuntimeCardMeta;
+}): FeishuCard['header'] {
+  const { status, statusZh, runtimeMeta } = params;
+  const agentLabel = runtimeMeta?.agentLabel?.trim() || 'main';
+  const template =
+    status === 'Completed'
+      ? 'green'
+      : status === 'Error'
+        ? 'red'
+        : status === 'Stopped'
+          ? 'grey'
+          : 'orange';
+  return {
+    title: {
+      tag: 'plain_text',
+      content: `${agentLabel} · ${status}`,
+      i18n_content: {
+        zh_cn: `${agentLabel} · ${statusZh}`,
+        en_us: `${agentLabel} · ${status}`,
+      },
+    },
+    template,
+  };
+}
+
+function buildRuntimeMetaLine(runtimeMeta?: RuntimeCardMeta): CardElement | null {
+  const segments = [
+    runtimeMeta?.agentLabel?.trim() ? `Agent: ${runtimeMeta.agentLabel.trim()}` : '',
+    runtimeMeta?.model?.trim() ? `Model: ${runtimeMeta.model.trim()}` : '',
+    runtimeMeta?.provider?.trim() ? `Provider: ${runtimeMeta.provider.trim()}` : '',
+  ].filter(Boolean);
+  if (segments.length === 0) return null;
+  const line = segments.join(' | ');
+  return {
+    tag: 'markdown',
+    content: line,
+    i18n_content: { zh_cn: line, en_us: line },
+    text_size: 'notation',
+  };
+}
+
+function buildThinkingCard(runtimeMeta?: RuntimeCardMeta): FeishuCard {
+  const statusLine = buildStatusLine({
+    status: 'Thinking',
+    statusZh: '思考中',
+    runtimeMeta,
+  });
   return {
     config: { wide_screen_mode: true, update_multi: true, locales: ['zh_cn', 'en_us'] },
+    header: buildHeader({ status: 'Thinking', statusZh: '思考中', runtimeMeta }),
     elements: [
+      ...(statusLine ? [statusLine] : []),
       {
         tag: 'markdown',
         content: 'Thinking...',
@@ -373,8 +467,21 @@ function buildThinkingCard(): FeishuCard {
   };
 }
 
-function buildStreamingCard(partialText: string, toolCalls: ToolCallInfo[], reasoningText?: string): FeishuCard {
+function buildStreamingCard(
+  partialText: string,
+  _toolCalls: ToolCallInfo[],
+  reasoningText?: string,
+  runtimeMeta?: RuntimeCardMeta,
+): FeishuCard {
   const elements: CardElement[] = [];
+  const statusLine = buildStatusLine({
+    status: 'Working',
+    statusZh: '处理中',
+    runtimeMeta,
+  });
+  if (statusLine) {
+    elements.push(statusLine);
+  }
 
   if (!partialText && reasoningText) {
     // Reasoning phase: show reasoning content in notation style
@@ -395,21 +502,9 @@ function buildStreamingCard(partialText: string, toolCalls: ToolCallInfo[], reas
     });
   }
 
-  // Tool calls in progress
-  if (toolCalls.length > 0) {
-    const toolLines = toolCalls.map((tc) => {
-      const statusIcon = tc.status === 'running' ? '\ud83d\udd04' : tc.status === 'complete' ? '\u2705' : '\u274c';
-      return `${statusIcon} ${tc.name} - ${tc.status}`;
-    });
-    elements.push({
-      tag: 'markdown',
-      content: toolLines.join('\n'),
-      text_size: 'notation',
-    });
-  }
-
   return {
     config: { wide_screen_mode: true, update_multi: true, locales: ['zh_cn', 'en_us'] },
+    header: buildHeader({ status: 'Working', statusZh: '处理中', runtimeMeta }),
     elements,
   };
 }
@@ -431,10 +526,28 @@ function buildCompleteCard(params: {
     model?: boolean;
   };
   footerMetrics?: FooterSessionMetrics;
+  runtimeMeta?: RuntimeCardMeta;
 }): FeishuCard {
-  const { text, toolCalls, elapsedMs, isError, reasoningText, reasoningElapsedMs, isAborted, footer, footerMetrics } =
-    params;
+  const {
+    text,
+    elapsedMs,
+    isError,
+    reasoningText,
+    reasoningElapsedMs,
+    isAborted,
+    footer,
+    footerMetrics,
+    runtimeMeta,
+  } = params;
   const elements: CardElement[] = [];
+  const statusLine = buildStatusLine({
+    status: isError ? 'Error' : isAborted ? 'Stopped' : 'Completed',
+    statusZh: isError ? '出错' : isAborted ? '已停止' : '已完成',
+    runtimeMeta: { ...runtimeMeta, elapsedMs },
+  });
+  if (statusLine) {
+    elements.push(statusLine);
+  }
 
   // Collapsible reasoning panel (before main content)
   if (reasoningText) {
@@ -481,20 +594,6 @@ function buildCompleteCard(params: {
     content: optimizeMarkdownStyle(text),
   });
 
-  // Tool calls summary
-  if (toolCalls.length > 0) {
-    const toolSummaryLines = toolCalls.map((tc) => {
-      const statusIcon = tc.status === 'complete' ? '\u2705' : '\u274c';
-      return `${statusIcon} **${tc.name}** - ${tc.status}`;
-    });
-
-    elements.push({
-      tag: 'markdown',
-      content: toolSummaryLines.join('\n'),
-      text_size: 'notation',
-    });
-  }
-
   // Footer meta-info: split into two lines for readability.
   // Line 1 (primary): status · elapsed · model
   // Line 2 (detail):  tokens · cache · context
@@ -520,6 +619,11 @@ function buildCompleteCard(params: {
     elements.push(...buildFooter(footerZhLines.join('\n'), footerEnLines.join('\n'), isError));
   }
 
+  const runtimeMetaLine = buildRuntimeMetaLine(runtimeMeta);
+  if (runtimeMetaLine) {
+    elements.push(runtimeMetaLine);
+  }
+
   // Use the answer text (not reasoning) as the feed preview summary.
   // Strip markdown syntax so the preview reads as plain text.
   const summaryText = text.replace(/[*_`#>[\]()~]/g, '').trim();
@@ -527,6 +631,11 @@ function buildCompleteCard(params: {
 
   return {
     config: { wide_screen_mode: true, update_multi: true, locales: ['zh_cn', 'en_us'], summary },
+    header: buildHeader({
+      status: isError ? 'Error' : isAborted ? 'Stopped' : 'Completed',
+      statusZh: isError ? '出错' : isAborted ? '已停止' : '已完成',
+      runtimeMeta,
+    }),
     elements,
   };
 }
