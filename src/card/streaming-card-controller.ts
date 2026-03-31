@@ -22,7 +22,6 @@ import { registerShutdownHook } from '../core/shutdown-hooks';
 import { sendCardFeishu, updateCardFeishu } from '../messaging/outbound/send';
 import {
   STREAMING_ELEMENT_ID,
-  STREAMING_STATUS_ELEMENT_ID,
   buildCardContent,
   buildStatusText,
   splitReasoningText,
@@ -107,17 +106,6 @@ function buildStreamingThinkingCard(agentLabel?: string) {
         {
           tag: 'markdown',
           content: 'Working · Thinking...',
-          i18n_content: {
-            zh_cn: '处理中 · 思考中...',
-            en_us: 'Working · Thinking...',
-          },
-          text_size: 'notation',
-          margin: '0px 0px 8px 0px',
-          element_id: STREAMING_STATUS_ELEMENT_ID,
-        },
-        {
-          tag: 'markdown',
-          content: '',
           text_align: 'left',
           text_size: 'normal_v2',
           margin: '0px 0px 0px 0px',
@@ -1085,6 +1073,12 @@ export class StreamingCardController {
     return statusText?.en || 'Working';
   }
 
+  private buildStreamingElementContent(resolvedText: string): string {
+    const statusText = this.buildStreamingStatusText();
+    if (!resolvedText) return statusText;
+    return `${statusText}\n\n${optimizeMarkdownStyle(resolvedText)}`;
+  }
+
   private async flushBufferedStateAfterCreate(): Promise<void> {
     if (!this.cardKit.cardMessageId || this.isTerminalPhase || !this.hasBufferedStreamingState()) return;
     await this.flush.flush();
@@ -1111,26 +1105,13 @@ export class StreamingCardController {
       const resolvedText = this.imageResolver.resolveImages(displayText);
 
       if (this.cardKit.cardKitCardId) {
-        // CardKit streaming — typewriter effect
-        const statusText = this.buildStreamingStatusText();
-        const statusSeqBefore = this.cardKit.cardKitSequence;
-        this.cardKit.cardKitSequence += 1;
-        log.debug('flushCardUpdate: status seq bump', {
-          seqBefore: statusSeqBefore,
-          seqAfter: this.cardKit.cardKitSequence,
-        });
-        await streamCardContent({
-          cfg: this.deps.cfg,
-          cardId: this.cardKit.cardKitCardId,
-          elementId: STREAMING_STATUS_ELEMENT_ID,
-          content: statusText,
-          sequence: this.cardKit.cardKitSequence,
-          accountId: this.deps.accountId,
-        });
-
+        // CardKit streaming — keep a single streaming element. Updating two
+        // elements via cardElement.content() can stall the second call in
+        // practice, which blocks all subsequent flushes.
+        const elementContent = this.buildStreamingElementContent(resolvedText);
         const prevSeq = this.cardKit.cardKitSequence;
         this.cardKit.cardKitSequence += 1;
-        log.debug('flushCardUpdate: content seq bump', {
+        log.debug('flushCardUpdate: element seq bump', {
           seqBefore: prevSeq,
           seqAfter: this.cardKit.cardKitSequence,
         });
@@ -1138,7 +1119,7 @@ export class StreamingCardController {
           cfg: this.deps.cfg,
           cardId: this.cardKit.cardKitCardId,
           elementId: STREAMING_ELEMENT_ID,
-          content: optimizeMarkdownStyle(resolvedText),
+          content: elementContent,
           sequence: this.cardKit.cardKitSequence,
           accountId: this.deps.accountId,
         });
