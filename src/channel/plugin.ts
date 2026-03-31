@@ -34,8 +34,8 @@ import {
 
 const pluginLog = larkLogger('channel/plugin');
 
-/** 状态轮询的探针结果缓存时长（10 分钟）。 */
-const PROBE_CACHE_TTL_MS = 10 * 60 * 1000;
+/** 状态轮询的探针结果缓存时长（5 分钟）。 */
+const PROBE_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -264,11 +264,11 @@ export class LarkClient {
   // ---- Bot identity ----------------------------------------------------------
 
   /**
-   * Probe bot identity via the `bot/v3/info` API.
+   * Probe bot identity via the `bot/v1/openclaw_bot/ping` API.
    * Results are cached on the instance for subsequent access via
    * `botOpenId` / `botName`.
    */
-  async probe(opts?: { maxAgeMs?: number }): Promise<FeishuProbeResult> {
+  async probe(opts?: { maxAgeMs?: number; needBotInfo?: boolean }): Promise<FeishuProbeResult> {
     const maxAge = opts?.maxAgeMs ?? 0;
 
     if (maxAge > 0 && this._lastProbeResult && Date.now() - this._lastProbeAt < maxAge) {
@@ -280,10 +280,11 @@ export class LarkClient {
     }
 
     try {
+      const needBotInfo = opts?.needBotInfo ?? true;
       const res = await (this.sdk as any).request({
-        method: 'GET',
-        url: '/open-apis/bot/v3/info',
-        data: {},
+        method: 'POST',
+        url: '/open-apis/bot/v1/openclaw_bot/ping',
+        data: { needBotInfo },
       });
 
       if (res.code !== 0) {
@@ -297,9 +298,9 @@ export class LarkClient {
         return result;
       }
 
-      const bot = res.bot || res.data?.bot;
-      this._botOpenId = bot?.open_id;
-      this._botName = bot?.bot_name;
+      const botInfo = res.data?.pingBotInfo;
+      this._botOpenId = botInfo?.botID;
+      this._botName = botInfo?.botName;
 
       const result: FeishuProbeResult = {
         ok: true,
