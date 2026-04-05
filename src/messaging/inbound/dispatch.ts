@@ -28,8 +28,6 @@ import {
   threadScopedKey,
   unregisterActiveDispatcher,
 } from '../../channel/chat-queue';
-import { resolveToolUseDisplayConfig } from '../../card/tool-use-config';
-import { clearToolUseTraceRun, startToolUseTraceRun } from '../../card/tool-use-trace-store';
 import { isLikelyAbortText } from '../../channel/abort-detect';
 import { isThreadCapableGroup } from '../../core/chat-info-cache';
 import { encodeFeishuRouteTarget } from '../../core/targets';
@@ -80,35 +78,20 @@ async function dispatchNormalMessage(
   if (isLikelyAbortText(dc.ctx.content?.trim() ?? '')) {
     dc.log(`feishu[${dc.account.accountId}]: abort message detected, using plain-text dispatch`);
     log.info('abort message detected, using plain-text dispatch');
-    await dispatchSystemCommand(dc, ctxPayload, replyToMessageId);
+    await dispatchSystemCommand(dc, ctxPayload, false, replyToMessageId);
     return;
-  }
-
-  const effectiveSessionKey = dc.threadSessionKey ?? dc.route.sessionKey;
-  const toolUseDisplay = resolveToolUseDisplayConfig({
-    cfg: dc.accountScopedCfg,
-    feishuCfg: dc.account.config,
-    agentId: dc.route.agentId,
-    sessionKey: effectiveSessionKey,
-    body: dc.ctx.content,
-  });
-  if (toolUseDisplay.showToolUse) {
-    startToolUseTraceRun(effectiveSessionKey);
-  } else {
-    clearToolUseTraceRun(effectiveSessionKey);
   }
 
   const { dispatcher, replyOptions, markDispatchIdle, markFullyComplete, abortCard } = createFeishuReplyDispatcher({
     cfg: dc.accountScopedCfg,
     agentId: dc.route.agentId,
+    sessionKey: dc.threadSessionKey ?? dc.route.sessionKey,
     chatId: dc.ctx.chatId,
-    sessionKey: effectiveSessionKey,
     replyToMessageId: replyToMessageId ?? dc.ctx.messageId,
     accountId: dc.account.accountId,
     chatType: dc.ctx.chatType,
     skipTyping,
     replyInThread: dc.isThread,
-    toolUseDisplay,
   });
 
   // Create an AbortController so the abort fast-path can cancel the
@@ -120,6 +103,7 @@ async function dispatchNormalMessage(
   const queueKey = buildQueueKey(dc.account.accountId, dc.ctx.chatId, dc.ctx.threadId);
   registerActiveDispatcher(queueKey, { abortCard, abortController });
 
+  const effectiveSessionKey = dc.threadSessionKey ?? dc.route.sessionKey;
   dc.log(`feishu[${dc.account.accountId}]: dispatching to agent (session=${effectiveSessionKey})`);
   log.info(`dispatching to agent (session=${effectiveSessionKey})`);
 
@@ -367,7 +351,7 @@ export async function dispatchToAgent(params: {
   const skillFilter = dc.isGroup ? (params.groupConfig?.skills ?? params.defaultGroupConfig?.skills) : undefined;
 
   if (isCommand) {
-    await dispatchSystemCommand(dc, ctxPayload, params.replyToMessageId);
+    await dispatchSystemCommand(dc, ctxPayload, false, params.replyToMessageId);
     // /new and /reset explicitly start a new session — clear pending history
     if (isBareNewOrReset && dc.isGroup && historyKey && params.chatHistories) {
       clearHistoryEntriesIfEnabled({

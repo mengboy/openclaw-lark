@@ -10,7 +10,6 @@
 
 import { optimizeMarkdownStyle } from './markdown-style';
 import type { FooterSessionMetrics } from './reply-dispatcher-types';
-import { EMPTY_TOOL_USE_PLACEHOLDER, type ToolUseDisplayStep } from './tool-use-display';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -23,10 +22,18 @@ import { EMPTY_TOOL_USE_PLACEHOLDER, type ToolUseDisplayStep } from './tool-use-
  */
 export const STREAMING_ELEMENT_ID = 'streaming_content';
 export const REASONING_ELEMENT_ID = 'reasoning_content';
+export const STREAMING_STATUS_ELEMENT_ID = 'streaming_status';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+export interface ToolCallInfo {
+  name: string;
+  status: 'running' | 'complete' | 'error';
+  args?: Record<string, unknown>;
+  result?: string;
+}
 
 export interface CardElement {
   tag: string;
@@ -53,6 +60,14 @@ export interface ConfirmData {
   operationDescription: string;
   pendingOperationId: string;
   preview?: string;
+}
+
+export interface RuntimeCardMeta {
+  agentLabel?: string;
+  provider?: string;
+  model?: string;
+  activityText?: string;
+  elapsedMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,14 +178,6 @@ function cleanReasoningPrefix(text: string): string {
 export function formatReasoningDuration(ms: number): { zh: string; en: string } {
   const d = formatElapsed(ms);
   return { zh: `思考了 ${d}`, en: `Thought for ${d}` };
-}
-
-/**
- * Format tool-use duration into a human-readable i18n pair.
- */
-export function formatToolUseDuration(ms: number): { zh: string; en: string } {
-  const d = formatElapsed(ms);
-  return { zh: `执行耗时 ${d}`, en: `Tool use for ${d}` };
 }
 
 /**
@@ -318,10 +325,7 @@ export function buildCardContent(
     text?: string;
     reasoningText?: string;
     reasoningElapsedMs?: number;
-    toolUseSteps?: ToolUseDisplayStep[];
-    toolUseTitleSuffix?: { zh: string; en: string };
-    toolUseElapsedMs?: number;
-    showToolUse?: boolean;
+    toolCalls?: ToolCallInfo[];
     confirmData?: ConfirmData;
     elapsedMs?: number;
     isError?: boolean;
@@ -335,32 +339,26 @@ export function buildCardContent(
       model?: boolean;
     };
     footerMetrics?: FooterSessionMetrics;
+    runtimeMeta?: RuntimeCardMeta;
   } = {},
 ): FeishuCard {
   switch (state) {
     case 'thinking':
-      return buildThinkingCard();
+      return buildThinkingCard(data.runtimeMeta);
     case 'streaming':
-      return buildStreamingCard(data.text ?? '', {
-        reasoningText: data.reasoningText,
-        showToolUse: data.showToolUse,
-        toolUseSteps: data.toolUseSteps,
-        toolUseTitleSuffix: data.toolUseTitleSuffix,
-      });
+      return buildStreamingCard(data.text ?? '', data.toolCalls ?? [], data.reasoningText, data.runtimeMeta);
     case 'complete':
       return buildCompleteCard({
         text: data.text ?? '',
+        toolCalls: data.toolCalls ?? [],
         elapsedMs: data.elapsedMs,
         isError: data.isError,
         reasoningText: data.reasoningText,
         reasoningElapsedMs: data.reasoningElapsedMs,
-        toolUseSteps: data.toolUseSteps,
-        toolUseTitleSuffix: data.toolUseTitleSuffix,
-        toolUseElapsedMs: data.toolUseElapsedMs,
-        showToolUse: data.showToolUse,
         isAborted: data.isAborted,
         footer: data.footer,
         footerMetrics: data.footerMetrics,
+        runtimeMeta: data.runtimeMeta,
       });
     case 'confirm':
       return buildConfirmCard(data.confirmData!);
@@ -373,10 +371,93 @@ export function buildCardContent(
 // Private card builders
 // ---------------------------------------------------------------------------
 
-function buildThinkingCard(): FeishuCard {
+function buildStatusLine(params: {
+  status: 'Thinking' | 'Working' | 'Completed' | 'Error' | 'Stopped';
+  statusZh: string;
+  runtimeMeta?: RuntimeCardMeta;
+}): CardElement | null {
+  const statusText = buildStatusText(params);
+  if (!statusText) return null;
+  return {
+    tag: 'markdown',
+    content: statusText.en,
+    i18n_content: { zh_cn: statusText.zh, en_us: statusText.en },
+    text_size: 'notation',
+  };
+}
+
+export function buildStatusText(params: {
+  status: 'Thinking' | 'Working' | 'Completed' | 'Error' | 'Stopped';
+  statusZh: string;
+  runtimeMeta?: RuntimeCardMeta;
+}): { zh: string; en: string } | null {
+  const { status, statusZh, runtimeMeta } = params;
+  const elapsed =
+    typeof runtimeMeta?.elapsedMs === 'number' && runtimeMeta.elapsedMs >= 0
+      ? formatElapsed(runtimeMeta.elapsedMs)
+      : undefined;
+  const activity = runtimeMeta?.activityText?.trim();
+  const detailEn = [status, elapsed, activity].filter(Boolean).join(' · ');
+  const detailZh = [statusZh, elapsed, activity].filter(Boolean).join(' · ');
+  if (!detailEn && !detailZh) return null;
+  return { zh: detailZh || detailEn, en: detailEn };
+}
+
+function buildHeader(params: {
+  status: 'Thinking' | 'Working' | 'Completed' | 'Error' | 'Stopped';
+  statusZh: string;
+  runtimeMeta?: RuntimeCardMeta;
+}): FeishuCard['header'] {
+  const { status, statusZh, runtimeMeta } = params;
+  const agentLabel = runtimeMeta?.agentLabel?.trim() || 'main';
+  const template =
+    status === 'Completed'
+      ? 'green'
+      : status === 'Error'
+        ? 'red'
+        : status === 'Stopped'
+          ? 'grey'
+          : 'orange';
+  return {
+    title: {
+      tag: 'plain_text',
+      content: `${agentLabel} · ${status}`,
+      i18n_content: {
+        zh_cn: `${agentLabel} · ${statusZh}`,
+        en_us: `${agentLabel} · ${status}`,
+      },
+    },
+    template,
+  };
+}
+
+function buildRuntimeMetaLine(runtimeMeta?: RuntimeCardMeta): CardElement | null {
+  const segments = [
+    runtimeMeta?.agentLabel?.trim() ? `Agent: ${runtimeMeta.agentLabel.trim()}` : '',
+    runtimeMeta?.model?.trim() ? `Model: ${runtimeMeta.model.trim()}` : '',
+    runtimeMeta?.provider?.trim() ? `Provider: ${runtimeMeta.provider.trim()}` : '',
+  ].filter(Boolean);
+  if (segments.length === 0) return null;
+  const line = segments.join(' | ');
+  return {
+    tag: 'markdown',
+    content: line,
+    i18n_content: { zh_cn: line, en_us: line },
+    text_size: 'notation',
+  };
+}
+
+function buildThinkingCard(runtimeMeta?: RuntimeCardMeta): FeishuCard {
+  const statusLine = buildStatusLine({
+    status: 'Thinking',
+    statusZh: '思考中',
+    runtimeMeta,
+  });
   return {
     config: { wide_screen_mode: true, update_multi: true, locales: ['zh_cn', 'en_us'] },
+    header: buildHeader({ status: 'Thinking', statusZh: '思考中', runtimeMeta }),
     elements: [
+      ...(statusLine ? [statusLine] : []),
       {
         tag: 'markdown',
         content: 'Thinking...',
@@ -388,26 +469,18 @@ function buildThinkingCard(): FeishuCard {
 
 function buildStreamingCard(
   partialText: string,
-  params: {
-    showToolUse?: boolean;
-    toolUseSteps?: ToolUseDisplayStep[];
-    toolUseTitleSuffix?: { zh: string; en: string };
-    reasoningText?: string;
-  } = {},
+  _toolCalls: ToolCallInfo[],
+  reasoningText?: string,
+  runtimeMeta?: RuntimeCardMeta,
 ): FeishuCard {
-  const { showToolUse = true, toolUseSteps, toolUseTitleSuffix, reasoningText } = params;
   const elements: CardElement[] = [];
-  const hasToolUse = Boolean(toolUseSteps?.length);
-
-  if (showToolUse) {
-    elements.push(
-      hasToolUse
-        ? buildToolUsePanel({
-            toolUseSteps,
-            titleSuffix: toolUseTitleSuffix,
-          })
-        : buildStreamingToolUsePendingPanel(),
-    );
+  const statusLine = buildStatusLine({
+    status: 'Working',
+    statusZh: '处理中',
+    runtimeMeta,
+  });
+  if (statusLine) {
+    elements.push(statusLine);
   }
 
   if (!partialText && reasoningText) {
@@ -431,20 +504,18 @@ function buildStreamingCard(
 
   return {
     config: { wide_screen_mode: true, update_multi: true, locales: ['zh_cn', 'en_us'] },
+    header: buildHeader({ status: 'Working', statusZh: '处理中', runtimeMeta }),
     elements,
   };
 }
 
 function buildCompleteCard(params: {
   text: string;
+  toolCalls: ToolCallInfo[];
   elapsedMs?: number;
   isError?: boolean;
   reasoningText?: string;
   reasoningElapsedMs?: number;
-  toolUseSteps?: ToolUseDisplayStep[];
-  toolUseTitleSuffix?: { zh: string; en: string };
-  toolUseElapsedMs?: number;
-  showToolUse?: boolean;
   isAborted?: boolean;
   footer?: {
     status?: boolean;
@@ -455,6 +526,7 @@ function buildCompleteCard(params: {
     model?: boolean;
   };
   footerMetrics?: FooterSessionMetrics;
+  runtimeMeta?: RuntimeCardMeta;
 }): FeishuCard {
   const {
     text,
@@ -462,24 +534,19 @@ function buildCompleteCard(params: {
     isError,
     reasoningText,
     reasoningElapsedMs,
-    toolUseSteps,
-    toolUseTitleSuffix,
-    toolUseElapsedMs,
-    showToolUse = true,
     isAborted,
     footer,
     footerMetrics,
+    runtimeMeta,
   } = params;
   const elements: CardElement[] = [];
-
-  if (showToolUse) {
-    elements.push(
-      buildToolUsePanel({
-        toolUseSteps,
-        toolUseElapsedMs,
-        titleSuffix: toolUseTitleSuffix,
-      }),
-    );
+  const statusLine = buildStatusLine({
+    status: isError ? 'Error' : isAborted ? 'Stopped' : 'Completed',
+    statusZh: isError ? '出错' : isAborted ? '已停止' : '已完成',
+    runtimeMeta: { ...runtimeMeta, elapsedMs },
+  });
+  if (statusLine) {
+    elements.push(statusLine);
   }
 
   // Collapsible reasoning panel (before main content)
@@ -552,13 +619,23 @@ function buildCompleteCard(params: {
     elements.push(...buildFooter(footerZhLines.join('\n'), footerEnLines.join('\n'), isError));
   }
 
-  // Use the answer text as the feed preview summary.
+  const runtimeMetaLine = buildRuntimeMetaLine(runtimeMeta);
+  if (runtimeMetaLine) {
+    elements.push(runtimeMetaLine);
+  }
+
+  // Use the answer text (not reasoning) as the feed preview summary.
   // Strip markdown syntax so the preview reads as plain text.
   const summaryText = text.replace(/[*_`#>[\]()~]/g, '').trim();
   const summary = summaryText ? { content: summaryText.slice(0, 120) } : undefined;
 
   return {
     config: { wide_screen_mode: true, update_multi: true, locales: ['zh_cn', 'en_us'], summary },
+    header: buildHeader({
+      status: isError ? 'Error' : isAborted ? 'Stopped' : 'Completed',
+      statusZh: isError ? '出错' : isAborted ? '已停止' : '已完成',
+      runtimeMeta,
+    }),
     elements,
   };
 }
@@ -650,118 +727,6 @@ function buildConfirmCard(confirmData: ConfirmData): FeishuCard {
  * Convert an old-format FeishuCard to CardKit JSON 2.0 format.
  * JSON 2.0 uses `body.elements` instead of top-level `elements`.
  */
-/**
- * Build the initial CardKit 2.0 streaming card with a loading icon.
- * Optionally includes a tool-use pending panel above the streaming area.
- */
-export function buildStreamingThinkingCard(showToolUse = true): Record<string, unknown> {
-  return buildStreamingPreAnswerCard({ showToolUse });
-}
-
-/**
- * Build a CardKit 2.0 card for the pre-answer streaming phase.
- * Used both for the initial card and for live updates during tool calls.
- */
-export function buildStreamingPreAnswerCard(params: {
-  steps?: ToolUseDisplayStep[];
-  elapsedMs?: number;
-  showToolUse?: boolean;
-}): Record<string, unknown> {
-  const { steps, elapsedMs, showToolUse = true } = params;
-  const hasSteps = Boolean(steps?.length);
-  const elements: unknown[] = [];
-
-  if (showToolUse) {
-    elements.push(
-      hasSteps ? buildStreamingToolUseActivePanel({ steps: steps!, elapsedMs }) : buildStreamingToolUsePendingPanel(),
-    );
-  }
-
-  elements.push({
-    tag: 'markdown',
-    content: '',
-    text_align: 'left',
-    text_size: 'normal_v2',
-    margin: '0px 0px 0px 0px',
-    element_id: STREAMING_ELEMENT_ID,
-  });
-
-  elements.push({
-    tag: 'markdown',
-    content: ' ',
-    icon: {
-      tag: 'custom_icon',
-      img_key: 'img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg',
-      size: '16px 16px',
-    },
-    element_id: 'loading_icon',
-  });
-
-  return {
-    schema: '2.0',
-    config: {
-      streaming_mode: true,
-      locales: ['zh_cn', 'en_us'],
-      summary: {
-        content: 'Processing...',
-        i18n_content: { zh_cn: '处理中...', en_us: 'Processing...' },
-      },
-    },
-    body: { elements },
-  };
-}
-
-/**
- * Build the collapsible panel for the active pre-answer phase.
- * Used by buildStreamingPreAnswerCard when at least one step exists.
- */
-function buildStreamingToolUseActivePanel(params: { steps: ToolUseDisplayStep[]; elapsedMs?: number }): CardElement {
-  const { steps, elapsedMs } = params;
-  const enParts = ['Tool use'];
-  const zhParts = ['工具执行'];
-
-  if (steps.length > 0) {
-    enParts.push(`${steps.length} step${steps.length === 1 ? '' : 's'}`);
-    zhParts.push(`${steps.length} 步`);
-  }
-
-  if (elapsedMs != null && elapsedMs > 0) {
-    const d = formatElapsed(elapsedMs);
-    enParts.push(`(${d})`);
-    zhParts.push(`(${d})`);
-  }
-
-  return {
-    tag: 'collapsible_panel',
-    expanded: true,
-    header: {
-      title: {
-        tag: 'plain_text',
-        content: `🛠️ ${enParts.join(' · ')}`,
-        i18n_content: {
-          zh_cn: `🛠️ ${zhParts.join(' · ')}`,
-          en_us: `🛠️ ${enParts.join(' · ')}`,
-        },
-        text_color: 'grey',
-        text_size: 'notation',
-      },
-      vertical_align: 'center',
-      icon: {
-        tag: 'standard_icon',
-        token: 'down-small-ccm_outlined',
-        color: 'grey',
-        size: '16px 16px',
-      },
-      icon_position: 'right',
-      icon_expanded_angle: -180,
-    },
-    border: { color: 'grey', corner_radius: '5px' },
-    vertical_spacing: '8px',
-    padding: '8px 8px 8px 8px',
-    elements: steps.map(buildToolUseStepElement),
-  };
-}
-
 export function toCardKit2(card: FeishuCard): Record<string, unknown> {
   const result: Record<string, unknown> = {
     schema: '2.0',
@@ -770,119 +735,4 @@ export function toCardKit2(card: FeishuCard): Record<string, unknown> {
   };
   if (card.header) result.header = card.header;
   return result;
-}
-
-function buildStreamingToolUsePendingPanel(): CardElement {
-  return {
-    tag: 'collapsible_panel',
-    expanded: false,
-    header: {
-      title: {
-        tag: 'plain_text',
-        content: '🛠️ Tool use pending',
-        i18n_content: {
-          zh_cn: '🛠️ 等待工具执行',
-          en_us: '🛠️ Tool use pending',
-        },
-        text_color: 'grey',
-        text_size: 'notation',
-      },
-      vertical_align: 'center',
-      icon: {
-        tag: 'standard_icon',
-        token: 'down-small-ccm_outlined',
-        color: 'grey',
-        size: '16px 16px',
-      },
-      icon_position: 'right',
-      icon_expanded_angle: -180,
-    },
-    border: { color: 'grey', corner_radius: '5px' },
-    vertical_spacing: '8px',
-    padding: '8px 8px 8px 8px',
-    elements: [],
-  };
-}
-
-function buildToolUsePanel(params: {
-  toolUseSteps?: ToolUseDisplayStep[];
-  toolUseElapsedMs?: number;
-  titleSuffix?: { zh: string; en: string };
-}): CardElement {
-  const { toolUseSteps = [], toolUseElapsedMs, titleSuffix } = params;
-  const duration = toolUseElapsedMs ? formatToolUseDuration(toolUseElapsedMs) : null;
-  const zhTitleParts = [duration?.zh ?? '工具执行'];
-  const enTitleParts = [duration?.en ?? 'Tool use'];
-  if (titleSuffix) {
-    zhTitleParts.push(titleSuffix.zh);
-    enTitleParts.push(titleSuffix.en);
-  }
-
-  const stepElements =
-    toolUseSteps.length > 0 ? toolUseSteps.map((step) => buildToolUseStepElement(step)) : [buildToolUsePlaceholder()];
-
-  return {
-    tag: 'collapsible_panel',
-    expanded: false,
-    header: {
-      title: {
-        tag: 'plain_text',
-        content: `🛠️ ${enTitleParts.join(' · ')}`,
-        i18n_content: {
-          zh_cn: `🛠️ ${zhTitleParts.join(' · ')}`,
-          en_us: `🛠️ ${enTitleParts.join(' · ')}`,
-        },
-        text_color: 'grey',
-        text_size: 'notation',
-      },
-      vertical_align: 'center',
-      icon: {
-        tag: 'standard_icon',
-        token: 'down-small-ccm_outlined',
-        color: 'grey',
-        size: '16px 16px',
-      },
-      icon_position: 'right',
-      icon_expanded_angle: -180,
-    },
-    border: { color: 'grey', corner_radius: '5px' },
-    vertical_spacing: '8px',
-    padding: '8px 8px 8px 8px',
-    elements: stepElements,
-  };
-}
-
-function buildToolUseStepElement(step: ToolUseDisplayStep): CardElement {
-  return {
-    tag: 'div',
-    icon: {
-      tag: 'standard_icon',
-      token: step.iconToken,
-      color: 'grey',
-    },
-    text: {
-      tag: 'plain_text',
-      content: step.detail ? `${step.title}\n${step.detail}` : step.title,
-      text_color: 'grey',
-      text_size: 'notation',
-    },
-  };
-}
-
-function buildToolUsePlaceholder(labels?: { zh: string; en: string }): CardElement {
-  const zh = labels?.zh ?? '暂无工具步骤';
-  const en = labels?.en ?? EMPTY_TOOL_USE_PLACEHOLDER;
-  return {
-    tag: 'div',
-    text: {
-      tag: 'plain_text',
-      content: en,
-      i18n_content: {
-        zh_cn: zh,
-        en_us: en,
-      },
-      text_color: 'grey',
-      text_size: 'notation',
-    },
-  };
 }

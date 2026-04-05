@@ -109,8 +109,9 @@ describe('sanitizeTextForCard', () => {
 });
 
 describe('prepareTerminalCardContent', () => {
-  it('sanitizes only the final answer body', () => {
+  it('shares the table budget across reasoning and body', () => {
     const rawText = ['Before', buildTable('real-1'), buildTable('real-2'), 'After'].join('\n\n');
+    const rawReasoningText = [buildTable('reason-1'), buildTable('reason-2')].join('\n\n');
 
     const imageResolver = {
       resolveImages(text: string) {
@@ -119,12 +120,16 @@ describe('prepareTerminalCardContent', () => {
     };
 
     const safeContent = prepareTerminalCardContent(
-      { text: rawText },
+      { text: rawText, reasoningText: rawReasoningText },
       imageResolver,
     );
 
     expect(safeContent.text).toMatch(/^Resolved/);
-    expect(findMarkdownTablesOutsideCodeBlocks(safeContent.text).length).toBe(2);
-    expect(safeContent.text).not.toContain('```');
+    expect(findMarkdownTablesOutsideCodeBlocks(safeContent.reasoningText!).length).toBe(2);
+    expect(findMarkdownTablesOutsideCodeBlocks(safeContent.text).length).toBe(1);
+    expect(safeContent.text).toMatch(
+      /```\n\| name \| value \|\n\| --- \| --- \|\n\| real-2 \| real-2 \|\n```/,
+    );
+    expect(safeContent.reasoningText).not.toContain('```\n| name | value |');
   });
 });

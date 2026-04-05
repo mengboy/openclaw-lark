@@ -98,7 +98,11 @@ describe('buildCardContent – footer line joining', () => {
   /** Extract footer markdown elements (notation-sized) from the card's top-level elements array. */
   function footerElements(card: ReturnType<typeof buildCardContent>) {
     const elements = (card as { elements?: Array<Record<string, unknown>> }).elements ?? [];
-    return elements.filter((el) => el.tag === 'markdown' && el.text_size === 'notation');
+    const notationElements = elements.filter((el) => el.tag === 'markdown' && el.text_size === 'notation');
+    return notationElements.slice(1).filter((el) => {
+      const content = typeof el.content === 'string' ? el.content : '';
+      return !content.includes('Agent:') && !content.includes('Provider:');
+    });
   }
 
   it('merges primary and detail lines into one markdown element with \\n', () => {
@@ -152,5 +156,59 @@ describe('buildCardContent – footer line joining', () => {
   it('renders no footer element when all footer flags are off', () => {
     const card = buildCardContent('complete', { text: 'hello' });
     expect(footerElements(card)).toHaveLength(0);
+  });
+});
+
+describe('buildCardContent – runtime status rendering', () => {
+  it('renders streaming header and status line with activity', () => {
+    const card = buildCardContent('streaming', {
+      text: 'partial reply',
+      toolCalls: [{ name: 'exec', status: 'running' }],
+      runtimeMeta: {
+        agentLabel: 'main',
+        activityText: 'running exec',
+        elapsedMs: 1234,
+      },
+    });
+
+    expect(card.header?.title.content).toContain('main · Working');
+    expect(card.header?.template).toBe('orange');
+
+    const elements = (card as { elements?: Array<Record<string, unknown>> }).elements ?? [];
+    const statusLine = elements.find((el) => el.tag === 'markdown' && el.text_size === 'notation');
+    expect(statusLine).toBeTruthy();
+    expect((statusLine?.content as string) || '').toContain('Working');
+    expect((statusLine?.content as string) || '').toContain('running exec');
+  });
+
+  it('renders complete header and runtime meta line with agent, model and provider', () => {
+    const card = buildCardContent('complete', {
+      text: 'done',
+      toolCalls: [{ name: 'exec', status: 'running' }],
+      runtimeMeta: {
+        agentLabel: 'main',
+        model: 'gpt-5.3-codex',
+        provider: 'openai-codex',
+      },
+    });
+
+    expect(card.header?.title.content).toContain('main · Completed');
+    expect(card.header?.template).toBe('green');
+
+    const elements = (card as { elements?: Array<Record<string, unknown>> }).elements ?? [];
+    const metaLine = elements.find(
+      (el) => el.tag === 'markdown' && el.text_size === 'notation' && typeof el.content === 'string' && (el.content as string).includes('Provider:'),
+    );
+    expect(metaLine).toBeTruthy();
+    expect((metaLine?.content as string) || '').toContain('Agent: main');
+    expect((metaLine?.content as string) || '').toContain('Model: gpt-5.3-codex');
+    expect((metaLine?.content as string) || '').toContain('Provider: openai-codex');
+
+    const joinedContent = elements
+      .filter((el) => el.tag === 'markdown' && typeof el.content === 'string')
+      .map((el) => el.content as string)
+      .join('\n');
+    expect(joinedContent).not.toContain('exec');
+    expect(joinedContent).not.toContain('running');
   });
 });

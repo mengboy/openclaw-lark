@@ -9,10 +9,8 @@
  * and unavailable-guard.ts.
  */
 
-import type { ClawdbotConfig } from 'openclaw/plugin-sdk';
-import type { ReplyDispatcher } from 'openclaw/plugin-sdk/reply-runtime';
+import type { ClawdbotConfig, ReplyPayload } from 'openclaw/plugin-sdk';
 import type { FeishuFooterConfig } from '../core/types';
-import type { ToolUseDisplayConfig } from './tool-use-config';
 
 // ---------------------------------------------------------------------------
 // CardPhase — explicit state machine replacing boolean flags
@@ -69,18 +67,11 @@ export interface ReasoningState {
   isReasoningPhase: boolean;
 }
 
-export interface ToolUseState {
-  startedAt: number | null;
-  elapsedMs: number;
-  isActive: boolean;
-}
-
 export interface StreamingTextState {
   accumulatedText: string;
   completedText: string;
   streamingPrefix: string;
   lastPartialText: string;
-  lastFlushedText: string;
 }
 
 export interface CardKitState {
@@ -109,7 +100,6 @@ export const THROTTLE_CONSTANTS = {
   PATCH_MS: 1500,
   LONG_GAP_THRESHOLD_MS: 2000,
   BATCH_AFTER_GAP_MS: 300,
-  REASONING_STATUS_MS: 1500,
 } as const;
 
 export const EMPTY_REPLY_FALLBACK_TEXT = 'Done.';
@@ -132,7 +122,21 @@ export interface CreateFeishuReplyDispatcherParams {
   skipTyping?: boolean;
   /** When true, replies are sent into the thread instead of main chat. */
   replyInThread?: boolean;
-  toolUseDisplay: ToolUseDisplayConfig;
+}
+
+/**
+ * Manual mirror of the SDK-internal ReplyDispatcher type
+ * (from openclaw/plugin-sdk auto-reply/reply/reply-dispatcher.d.ts).
+ *
+ * Must be kept in sync when the SDK updates the dispatcher signature.
+ */
+export interface ReplyDispatcher {
+  sendToolResult: (payload: ReplyPayload) => boolean;
+  sendBlockReply: (payload: ReplyPayload) => boolean;
+  sendFinalReply: (payload: ReplyPayload) => boolean;
+  waitForIdle: () => Promise<void>;
+  getQueuedCounts: () => Record<string, number>;
+  markComplete: () => void;
 }
 
 /**
@@ -164,15 +168,16 @@ export interface FooterSessionMetrics {
   totalTokensFresh?: boolean;
   contextTokens?: number;
   model?: string;
+  provider?: string;
 }
 
 export interface StreamingCardDeps {
   cfg: ClawdbotConfig;
+  agentId: string;
   sessionKey: string;
   accountId: string | undefined;
   chatId: string;
   replyToMessageId: string | undefined;
   replyInThread: boolean | undefined;
-  toolUseDisplay: ToolUseDisplayConfig;
   resolvedFooter: Required<FeishuFooterConfig>;
 }

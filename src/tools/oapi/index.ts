@@ -18,7 +18,6 @@ import {
 } from './calendar/index';
 import {
   registerFeishuTaskCommentTool,
-  registerFeishuTaskSectionTool,
   registerFeishuTaskSubtaskTool,
   registerFeishuTaskTaskTool,
   registerFeishuTaskTasklistTool,
@@ -61,7 +60,6 @@ export function registerOapiTools(api: OpenClawPluginApi): void {
   // Task tools
   registerFeishuTaskTaskTool(api);
   registerFeishuTaskTasklistTool(api);
-  registerFeishuTaskSectionTool(api);
   registerFeishuTaskCommentTool(api);
   registerFeishuTaskSubtaskTool(api);
 
