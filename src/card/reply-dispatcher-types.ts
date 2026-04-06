@@ -97,7 +97,7 @@ export interface CardKitState {
  */
 export const THROTTLE_CONSTANTS = {
   CARDKIT_MS: 100,
-  PATCH_MS: 1500,
+  PATCH_MS: 5000,
   LONG_GAP_THRESHOLD_MS: 2000,
   BATCH_AFTER_GAP_MS: 300,
 } as const;

@@ -486,7 +486,7 @@ export class StreamingCardController {
         if (!this.isTerminalPhase && this.cardKit.cardMessageId) {
           this.elapsedRefreshTimer = setTimeout(() => {
             void tick();
-          }, 1000);
+          }, 5000);
         } else {
           this.elapsedRefreshTimer = null;
         }
@@ -494,7 +494,7 @@ export class StreamingCardController {
     };
     this.elapsedRefreshTimer = setTimeout(() => {
       void tick();
-    }, 1000);
+    }, 5000);
   }
 
   private stopElapsedRefresh(): void {
